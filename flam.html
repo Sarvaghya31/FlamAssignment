@@ -1,0 +1,335 @@
+<!--
+README
+======
+
+File: interactive-bezier-rope.html
+Platform: Web (plain HTML + JavaScript + Canvas)
+Purpose: Interactive cubic Bézier curve that behaves like a springy rope.
+
+What this contains
+------------------
+1. Full implementation of cubic Bézier math (B(t)) and derivative B'(t).
+2. Spring-damper physics for control points P1 and P2:
+   acceleration = -k * (position - target) - damping * velocity
+   Uses an explicit Euler integrator with variable dt.
+3. Interaction:
+   - Mouse move sets the "target" for dynamic control points.
+   - Click + drag a control point to move it directly.
+   - Toggle options and sliders to change stiffness (k), damping, tangent length, and samples.
+4. Rendering:
+   - Samples the curve with small t increments (default 0.01) and draws the path by connecting sampled points.
+   - Draws normalized tangent vectors at regular intervals along the curve.
+   - Shows control points as draggable circles and endpoint anchors.
+5. Performance:
+   - Uses requestAnimationFrame and tracks dt to keep motion consistent.
+   - Keeps drawing cheap primitives and uses sampling instead of heavy algorithms to keep frame rate high.
+
+Math & Physics notes
+--------------------
+Cubic Bézier (four points P0..P3):
+B(t) = (1-t)^3 * P0 + 3(1-t)^2 t * P1 + 3(1-t) t^2 * P2 + t^3 * P3
+
+Derivative (tangent):
+B'(t) = 3(1-t)^2 (P1 - P0) + 6(1-t)t (P2 - P1) + 3t^2 (P3 - P2)
+Normalize B'(t) for unit direction when drawing tangent blades.
+
+Spring-damper model used per control point:
+acc = -k * (pos - target) - damping * vel
+vel += acc * dt
+pos += vel * dt
+
+Design choices
+--------------
+- Both P1 and P2 are dynamic and use the same physics constants by default.
+- The mouse position acts as the "global" target; each control point's target is a blend of its anchor position and the mouse to give more natural rope behavior.
+- Dragging control points overrides the physics input until released.
+
+How to run
+----------
+1. Save this file to disk (interactive-bezier-rope.html).
+2. Open in any modern browser (Chrome, Firefox, Safari).
+3. Move the mouse around, click-and-drag P1/P2 to interact. On mobile, tilt support via DeviceOrientation is attempted (if the browser exposes it).
+4. Record a short screen capture (max 30s) demonstrating the interactivity for submission.
+
+Adapting for native iOS (brief)
+------------------------------
+- Replace mouse input with CoreMotion (CMMotionManager) to read device attitude (roll/pitch/yaw).
+- Use CADisplayLink for 60 FPS updates.
+- Port same math & physics logic into Swift; draw with CoreGraphics or Metal/MetalKit for performance.
+
+-->
+
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Interactive Bézier Rope (Web)</title>
+  <style>
+    html,body{height:100%;margin:0;background:#0f172a;color:#e6eef8;font-family:Inter,system-ui,Arial}
+    #app{display:flex;gap:12px;height:100%;}
+    canvas{flex:1;background:linear-gradient(180deg,#021026,#081026);display:block}
+    .panel{width:320px;padding:12px;box-sizing:border-box;background:rgba(255,255,255,0.04);backdrop-filter:blur(6px)}
+    h1{font-size:18px;margin:6px 0}
+    label{display:block;margin:8px 0;font-size:13px}
+    input[type=range]{width:100%}
+    .row{display:flex;gap:8px;align-items:center}
+    .btn{padding:6px 10px;border-radius:8px;border:0;background:#2563eb;color:white;cursor:pointer}
+    small{color:#9fb0ce}
+  </style>
+</head>
+<body>
+  <div id="app">
+    <canvas id="c"></canvas>
+    <div class="panel">
+      <h1>Interactive Bézier Rope</h1>
+      <p><small>Move mouse to pull P1 & P2. Drag control points to move directly.</small></p>
+
+      <label>Stiffness (k): <span id="kVal">60</span></label>
+      <input id="k" type="range" min="5" max="500" value="60">
+
+      <label>Damping: <span id="dVal">10</span></label>
+      <input id="d" type="range" min="0" max="80" value="10">
+
+      <label>Tangent length: <span id="tLenVal">40</span></label>
+      <input id="tlen" type="range" min="8" max="120" value="40">
+
+      <label>Curve samples (1 / step): <span id="stepVal">100</span></label>
+      <input id="step" type="range" min="10" max="400" value="100">
+
+      <label class="row"><input id="showTangents" type="checkbox" checked> Show tangents</label>
+      <label class="row"><input id="showControlLines" type="checkbox" checked> Show control polygon</label>
+
+      <hr>
+      <p><small>FPS: <span id="fps">--</span></small></p>
+      <button id="reset" class="btn">Reset Positions</button>
+      <p style="margin-top:12px"><small>Tip: Try different stiffness/damping combinations. For iOS native, port motion input from CoreMotion and use CADisplayLink.</small></p>
+    </div>
+  </div>
+
+  <script>
+  // ---- Utilities ----
+  function vec(x,y){return {x:x,y:y}}
+  function add(a,b){return {x:a.x+b.x,y:a.y+b.y}}
+  function sub(a,b){return {x:a.x-b.x,y:a.y-b.y}}
+  function mul(a,s){return {x:a.x*s,y:a.y*s}}
+  function len(a){return Math.hypot(a.x,a.y)}
+  function norm(a){const L=len(a)||1;return {x:a.x/L,y:a.y/L}}
+
+  // ---- Bézier math ----
+  function bezierPoint(t,P0,P1,P2,P3){
+    const u = 1-t;
+    const u3 = u*u*u;
+    const t3 = t*t*t;
+    const b0 = u3;
+    const b1 = 3*u*u*t;
+    const b2 = 3*u*t*t;
+    const b3 = t3;
+    return {
+      x: b0*P0.x + b1*P1.x + b2*P2.x + b3*P3.x,
+      y: b0*P0.y + b1*P1.y + b2*P2.y + b3*P3.y
+    };
+  }
+
+  function bezierTangent(t,P0,P1,P2,P3){
+    const u = 1-t;
+    const term1 = mul(sub(P1,P0), 3*u*u);
+    const term2 = mul(sub(P2,P1), 6*u*t);
+    const term3 = mul(sub(P3,P2), 3*t*t);
+    return add(add(term1, term2), term3);
+  }
+
+  // ---- Setup canvas & controls ----
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+  let W, H;
+  function resize(){
+    canvas.width = window.innerWidth - 320; // panel width
+    canvas.height = window.innerHeight;
+    W = canvas.width; H = canvas.height;
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // Controls
+  const kSlider = document.getElementById('k');
+  const dSlider = document.getElementById('d');
+  const tlenSlider = document.getElementById('tlen');
+  const stepSlider = document.getElementById('step');
+  const kVal = document.getElementById('kVal');
+  const dVal = document.getElementById('dVal');
+  const tLenVal = document.getElementById('tLenVal');
+  const stepVal = document.getElementById('stepVal');
+  const showTangents = document.getElementById('showTangents');
+  const showControlLines = document.getElementById('showControlLines');
+  const fpsEl = document.getElementById('fps');
+  function updateUI(){kVal.textContent = kSlider.value; dVal.textContent = dSlider.value; tLenVal.textContent = tlenSlider.value; stepVal.textContent = stepSlider.value;}
+  [kSlider,dSlider,tlenSlider,stepSlider].forEach(s=>s.addEventListener('input',updateUI));
+  updateUI();
+
+  // ---- Control points & physics state ----
+  const P0 = vec(80, H/2); // left fixed
+  const P3 = vec(W-80, H/2); // right fixed
+
+  // dynamic control points have physics state
+  const cp = {
+    P1: {pos: vec(W*0.33, H/2 - 100), vel: vec(0,0), target: vec(W*0.33, H/2 - 100), dragging:false},
+    P2: {pos: vec(W*0.66, H/2 + 100), vel: vec(0,0), target: vec(W*0.66, H/2 + 100), dragging:false}
+  };
+
+  function resetPositions(){
+    P0.x = 80; P0.y = H/2;
+    P3.x = W-80; P3.y = H/2;
+    cp.P1.pos = vec(W*0.33, H/2 - 100);
+    cp.P2.pos = vec(W*0.66, H/2 + 100);
+    cp.P1.vel = vec(0,0); cp.P2.vel = vec(0,0);
+  }
+
+  document.getElementById('reset').addEventListener('click',()=>{resetPositions();});
+
+  // Mouse input
+  const mouse = {x: W/2, y: H/2, down:false};
+  canvas.addEventListener('mousemove', (e)=>{ const r=canvas.getBoundingClientRect(); mouse.x = e.clientX - r.left; mouse.y = e.clientY - r.top; });
+  canvas.addEventListener('mousedown', (e)=>{ mouse.down=true; startDrag(e); });
+  window.addEventListener('mouseup', (e)=>{ mouse.down=false; endDrag(); });
+
+  // Touch input (for mobile)
+  canvas.addEventListener('touchstart', (e)=>{ e.preventDefault(); const t=e.touches[0]; const r=canvas.getBoundingClientRect(); mouse.x=t.clientX-r.left; mouse.y=t.clientY-r.top; mouse.down=true; startDrag(e.touches[0]); }, {passive:false});
+  canvas.addEventListener('touchmove', (e)=>{ e.preventDefault(); const t=e.touches[0]; const r=canvas.getBoundingClientRect(); mouse.x=t.clientX-r.left; mouse.y=t.clientY-r.top; }, {passive:false});
+  canvas.addEventListener('touchend', (e)=>{ mouse.down=false; endDrag(); }, {passive:false});
+
+  // Dragging control points
+  let draggingKey = null;
+  function distSq(a,b){const dx=a.x-b.x, dy=a.y-b.y; return dx*dx+dy*dy}
+  function startDrag(e){
+    const r=canvas.getBoundingClientRect(); const mx = mouse.x, my = mouse.y;
+    const threshold = 18*18;
+    if(distSq(cp.P1.pos, {x:mx,y:my}) < threshold){ cp.P1.dragging = true; draggingKey='P1'; }
+    else if(distSq(cp.P2.pos, {x:mx,y:my}) < threshold){ cp.P2.dragging = true; draggingKey='P2'; }
+  }
+  function endDrag(){ if(draggingKey){ cp[draggingKey].dragging=false; draggingKey=null; } }
+
+  // DeviceOrientation fallback (mobile tilt -> target)
+  if(window.DeviceOrientationEvent){
+    window.addEventListener('deviceorientation', (ev)=>{
+      // map gamma(-90..90) and beta(-180..180) to screen offsets
+      const g = ev.gamma || 0; const b = ev.beta || 0;
+      // small sensitive mapping
+      const rx = (g/45) * (W*0.25);
+      const ry = (b/45) * (H*0.25);
+      mouse.x = W/2 + rx; mouse.y = H/2 + ry;
+    });
+  }
+
+  // ---- Main loop / physics ----
+  let last = performance.now();
+  let fpsCounter = 0, fpsTime = 0;
+
+  function step(){
+    const now = performance.now();
+    let dt = (now - last) / 1000; if(dt>0.05) dt=0.05; last = now; // clamp large dt
+
+    // update fps
+    fpsCounter++; fpsTime += dt; if(fpsTime>0.5){ fpsEl.textContent = Math.round(fpsCounter / fpsTime); fpsCounter=0; fpsTime=0; }
+
+    // physics constants
+    const k = parseFloat(kSlider.value);
+    const damping = parseFloat(dSlider.value);
+
+    // update targets for control points based on mouse
+    // Use a blend so the rope doesn't instantly snap: each CP has a rest anchor near its original
+    const anchor1 = vec(W*0.33, H/2 - 100);
+    const anchor2 = vec(W*0.66, H/2 + 100);
+
+    // Calculate each CP's target as a blend between anchor and mouse (closer to mouse when mouse near the midpoint)
+    const midpointInfluence = Math.max(0, 1 - Math.abs((mouse.x - W/2) / (W*0.6)) );
+    cp.P1.target.x = anchor1.x * (1 - 0.35) + mouse.x * 0.35; cp.P1.target.y = anchor1.y * (1 - 0.35) + mouse.y * 0.35;
+    cp.P2.target.x = anchor2.x * (1 - 0.35) + mouse.x * 0.35; cp.P2.target.y = anchor2.y * (1 - 0.35) + mouse.y * 0.35;
+
+    // If dragging, set pos directly to mouse
+    if(cp.P1.dragging){ cp.P1.pos.x = mouse.x; cp.P1.pos.y = mouse.y; cp.P1.vel = vec(0,0); }
+    if(cp.P2.dragging){ cp.P2.pos.x = mouse.x; cp.P2.pos.y = mouse.y; cp.P2.vel = vec(0,0); }
+
+    // integrate physics for non-dragging points
+    ['P1','P2'].forEach(kp=>{
+      const s = cp[kp];
+      if(s.dragging) return;
+      const disp = sub(s.pos, s.target);
+      const acc = add(mul(disp, -k), mul(s.vel, -damping));
+      s.vel.x += acc.x * dt; s.vel.y += acc.y * dt;
+      s.pos.x += s.vel.x * dt; s.pos.y += s.vel.y * dt;
+    });
+
+    draw();
+    requestAnimationFrame(step);
+  }
+
+  // ---- Drawing ----
+  function draw(){
+    ctx.clearRect(0,0,W,H);
+
+    // Background subtle vignette
+    const g = ctx.createLinearGradient(0,0,0,H);
+    g.addColorStop(0,'rgba(2,16,38,0.2)'); g.addColorStop(1,'rgba(2,8,18,0.2)');
+    ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+
+    // points
+    const P1 = cp.P1.pos, P2 = cp.P2.pos;
+
+    // Draw control polygon
+    if(showControlLines.checked){
+      ctx.lineWidth = 1; ctx.strokeStyle = 'rgba(160,200,255,0.12)';
+      ctx.beginPath(); ctx.moveTo(P0.x,P0.y); ctx.lineTo(P1.x,P1.y); ctx.lineTo(P2.x,P2.y); ctx.lineTo(P3.x,P3.y); ctx.stroke();
+    }
+
+    // Draw sampled curve
+    const samples = parseInt(stepSlider.value,10);
+    ctx.lineWidth = 3; ctx.strokeStyle = '#60a5fa'; ctx.beginPath();
+    for(let i=0;i<=samples;i++){
+      const t = i/samples; const p = bezierPoint(t,P0,P1,P2,P3);
+      if(i==0) ctx.moveTo(p.x,p.y); else ctx.lineTo(p.x,p.y);
+    }
+    ctx.stroke();
+
+    // Tangents
+    if(showTangents.checked){
+      const tlen = parseFloat(tlenSlider.value);
+      ctx.lineWidth = 2; ctx.lineCap = 'round';
+      for(let i=0;i<=10;i++){
+        const t = i/10; const p = bezierPoint(t,P0,P1,P2,P3);
+        let tg = bezierTangent(t,P0,P1,P2,P3);
+        const L = len(tg) || 1; tg = {x:tg.x/L, y:tg.y/L};
+        // draw a short centered line
+        const hx = tg.x * tlen * 0.5; const hy = tg.y * tlen * 0.5;
+        ctx.strokeStyle = 'rgba(255,215,90,0.9)';
+        ctx.beginPath(); ctx.moveTo(p.x - hx, p.y - hy); ctx.lineTo(p.x + hx, p.y + hy); ctx.stroke();
+      }
+    }
+
+    // Draw endpoints
+    ctx.fillStyle = '#ffd43b'; ctx.beginPath(); ctx.arc(P0.x,P0.y,8,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(P3.x,P3.y,8,0,Math.PI*2); ctx.fill();
+
+    // Draw control points
+    function drawCP(point,state, label){
+      // halo
+      ctx.beginPath(); ctx.fillStyle = 'rgba(96,165,250,0.08)'; ctx.arc(point.x,point.y,20,0,Math.PI*2); ctx.fill();
+      // main
+      ctx.beginPath(); ctx.fillStyle = state.dragging ? '#34d399' : '#60a5fa'; ctx.arc(point.x,point.y,10,0,Math.PI*2); ctx.fill();
+      // outline
+      ctx.lineWidth = 1; ctx.strokeStyle = 'rgba(255,255,255,0.12)'; ctx.stroke();
+      // label
+      ctx.fillStyle = '#cfe8ff'; ctx.font = '12px system-ui'; ctx.fillText(label, point.x + 12, point.y - 10);
+    }
+    drawCP(P1, cp.P1, 'P1'); drawCP(P2, cp.P2, 'P2');
+
+    // draw instruction text
+    ctx.fillStyle = 'rgba(255,255,255,0.06)'; ctx.font='12px system-ui'; ctx.fillText('Drag P1/P2 — Move mouse to pull', 12, H-16);
+  }
+
+  // Start
+  resetPositions();
+  requestAnimationFrame(step);
+  </script>
+</body>
+</html>
