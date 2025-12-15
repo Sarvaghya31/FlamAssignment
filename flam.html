@@ -1,4 +1,5 @@
 
+
 <!doctype html>
 <html lang="en">
 <head>
@@ -134,6 +135,10 @@
   canvas.addEventListener('mousedown', (e)=>{ mouse.down=true; startDrag(e); });
   window.addEventListener('mouseup', (e)=>{ mouse.down=false; endDrag(); });
 
+  // Touch input (for mobile)
+  canvas.addEventListener('touchstart', (e)=>{ e.preventDefault(); const t=e.touches[0]; const r=canvas.getBoundingClientRect(); mouse.x=t.clientX-r.left; mouse.y=t.clientY-r.top; mouse.down=true; startDrag(e.touches[0]); }, {passive:false});
+  canvas.addEventListener('touchmove', (e)=>{ e.preventDefault(); const t=e.touches[0]; const r=canvas.getBoundingClientRect(); mouse.x=t.clientX-r.left; mouse.y=t.clientY-r.top; }, {passive:false});
+  canvas.addEventListener('touchend', (e)=>{ mouse.down=false; endDrag(); }, {passive:false});
 
   // Dragging control points
   let draggingKey = null;
@@ -146,6 +151,17 @@
   }
   function endDrag(){ if(draggingKey){ cp[draggingKey].dragging=false; draggingKey=null; } }
 
+  // DeviceOrientation fallback (mobile tilt -> target)
+  if(window.DeviceOrientationEvent){
+    window.addEventListener('deviceorientation', (ev)=>{
+      // map gamma(-90..90) and beta(-180..180) to screen offsets
+      const g = ev.gamma || 0; const b = ev.beta || 0;
+      // small sensitive mapping
+      const rx = (g/45) * (W*0.25);
+      const ry = (b/45) * (H*0.25);
+      mouse.x = W/2 + rx; mouse.y = H/2 + ry;
+    });
+  }
 
   // ---- Main loop / physics ----
   let last = performance.now();
